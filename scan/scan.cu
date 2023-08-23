@@ -27,6 +27,28 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+#define checkCudaErrors(call)                                 \
+    do {                                                      \
+        cudaError_t err = call;                               \
+        if (err != cudaSuccess) {                             \
+            fprintf(stderr, "CUDA Error: %s at line %d in file %s\n", \
+                    cudaGetErrorString(err), __LINE__, __FILE__); \
+            exit(EXIT_FAILURE);                               \
+        }                                                     \
+    } while (0)
+
+#define checkKernelErrors()                                   \
+    do {                                                      \
+        cudaError_t err = cudaGetLastError();                 \
+        if (err != cudaSuccess) {                             \
+            fprintf(stderr, "Kernel Execution Error: %s at line %d in file %s\n", \
+                    cudaGetErrorString(err), __LINE__, __FILE__); \
+            exit(EXIT_FAILURE);                               \
+        }                                                     \
+    } while (0)
+
+
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -42,6 +64,150 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
+
+
+__device__ void scan_per_warp(int* share_memory, int lane, int* warp_sum)
+{
+    for(int two_d = 1; two_d <= 16; two_d*=2)
+    {
+        int two_dplus1 = 2 * two_d;
+        if( (lane + 1) % two_dplus1 == 0 && threadIdx.x >= two_d)
+            share_memory[threadIdx.x] += share_memory[threadIdx.x - two_d];
+        
+        __syncwarp(); 
+    }
+    if(lane == 31)
+    {
+        warp_sum[threadIdx.x >> 5] = share_memory[threadIdx.x];
+        share_memory[threadIdx.x] = 0;
+    }
+    __syncwarp();
+    
+    for(int two_d = 16; two_d >= 1; two_d /= 2)
+    {
+        int two_dplus1 = 2 * two_d;
+        if( (lane + 1) % two_dplus1 == 0 && threadIdx.x >= two_d)
+        {
+            int t = share_memory[threadIdx.x - two_d];
+            share_memory[threadIdx.x - two_d] = share_memory[threadIdx.x];
+            share_memory[threadIdx.x] += t;
+        }
+        __syncwarp();
+    }
+}
+
+__device__ void scan_warp_sum(int *warp_sum, int lane, int* part_sum, int part_i)
+{
+    for(int two_d = 1; two_d <= 16; two_d*=2)
+    {
+        int two_dplus1 = 2 * two_d;
+        if( (lane + 1) % two_dplus1 == 0 && threadIdx.x >= two_d)
+            warp_sum[threadIdx.x] += warp_sum[threadIdx.x - two_d];
+        
+        __syncwarp(); 
+    }
+    if(lane == 31)
+    {
+        part_sum[part_i] = warp_sum[threadIdx.x];
+        warp_sum[threadIdx.x] = 0;
+    }
+    __syncwarp();
+    
+    for(int two_d = 16; two_d >= 1; two_d /= 2)
+    {
+        int two_dplus1 = 2 * two_d;
+        if( (lane + 1) % two_dplus1 == 0 && threadIdx.x >= two_d)
+        {
+            int t = warp_sum[threadIdx.x - two_d];
+            warp_sum[threadIdx.x - two_d] = warp_sum[threadIdx.x];
+            warp_sum[threadIdx.x] += t;
+        }
+        __syncwarp();
+    }
+}
+
+__device__ void scan_per_block(int* share_memory, int* part_sum, int part_i)
+{
+    int warp_id = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+
+    // make sure blockDim.x / 32 == 32
+    __shared__ int warp_sum[32];
+    scan_per_warp(share_memory, lane, warp_sum);
+    __syncthreads();
+
+    // if(lane == 31)
+    //     warp_sum[warp_id] = share_memory[threadIdx.x];
+    // __syncthreads();
+
+    // scan warp sum and set part_sum
+    if(warp_id == 0)
+    {
+        scan_warp_sum(warp_sum, lane, part_sum, part_i);
+    }
+    __syncthreads();
+
+    // add warp sum
+    if(warp_id > 0)
+        share_memory[(warp_id << 5) + lane] += warp_sum[warp_id];
+    __syncthreads();
+
+}
+
+__global__ void exclusive_scan_per_block(int* input, int *result, int* part_sum, int N, int part_num)
+{
+    // __shared__ int share_memory[blockDim.x];
+    __shared__ int share_memory[1024];
+    for (size_t part_i = blockIdx.x; part_i < part_num; part_i += gridDim.x) {
+        size_t thread_id = part_i * blockDim.x + threadIdx.x;
+        if(thread_id < N)
+            share_memory[threadIdx.x] = input[thread_id];
+
+        __syncthreads();
+        scan_per_block(share_memory, part_sum, part_i);
+        __syncthreads();
+
+        if(thread_id < N)
+            result[thread_id] = share_memory[threadIdx.x];
+        // if(threadIdx.x == blockDim.x - 1)
+        //     part_sum[part_i] = share_memory[threadIdx.x];
+    }
+} 
+
+__global__ void scan_part_sum(int* part_sum, int part_num)
+{
+    // __shared__ int share_memory[part_num];
+    // part_sum[0] = 0;
+    for(int i = 1; i < part_num; ++i)
+    {
+        part_sum[i] += part_sum[i-1];
+    }
+
+}
+
+__global__ void add_part_sum(int* result, int* part_sum, int part_num, int N)
+{
+    // 有partnum个base 需要加到里面，每个base需要加blocksize次数
+    // __shared__ int* share_memory[blockDim.x];
+    __shared__ int share_memory[1024];
+    for(size_t i = blockIdx.x; i < part_num; i+=gridDim.x)
+    {
+        int thread_id = threadIdx.x + i * blockDim.x;
+        if(thread_id < N)
+            share_memory[threadIdx.x] = result[thread_id];
+        __syncthreads();
+
+        // __shared__ int part_sum_i = part_sum[i];
+        if(i > 0)
+            share_memory[threadIdx.x] += part_sum[i-1];
+        __syncthreads();
+
+        if(thread_id < N)
+            result[thread_id] = share_memory[threadIdx.x];
+        __syncthreads();
+    }
+}
+
 void exclusive_scan(int* input, int N, int* result)
 {
 
@@ -53,8 +219,23 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    size_t block_size = 1024;
+    size_t part_num = (N + block_size - 1) / block_size;
+    size_t block_num = std::min<size_t>(part_num, 128);
+    int* part_sum = nullptr;
 
+    cudaMalloc((void **)&part_sum, sizeof(int)*part_num);
 
+    exclusive_scan_per_block<<<block_num, block_size>>>(input, result, part_sum, N, part_num);
+    cudaDeviceSynchronize();
+    checkKernelErrors();
+    scan_part_sum<<<1, 1>>>(part_sum, part_num);
+    cudaDeviceSynchronize();
+    checkKernelErrors();
+    add_part_sum<<<block_num, block_size>>>(result, part_sum, part_num, N);
+    cudaDeviceSynchronize();
+    checkKernelErrors();
+    cudaFree(part_sum);
 }
 
 
