@@ -322,6 +322,56 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void set_flag(int* device_input, int length, int part_num, int* temp)
+{
+    __shared__ int share_memory[1024];
+    __shared__ int share_memory_shift[1024];
+    for(size_t part_i = blockIdx.x; part_i < part_num; part_i += gridDim.x)
+    {
+        size_t thread_id = threadIdx.x + part_i * blockDim.x;
+        if(thread_id < length)
+        {
+            share_memory[threadIdx.x] = device_input[thread_id];
+            if(threadIdx.x < length - 1)
+                share_memory_shift[threadIdx.x] = device_input[thread_id + 1];
+
+            __syncthreads();
+            if(share_memory[threadIdx.x] == share_memory_shift[threadIdx.x])
+            {
+                temp[thread_id] = 1;
+            }
+            else{
+                temp[thread_id] = 0;
+            }
+        }
+        __syncthreads();
+    }
+}
+__global__ void scatter(int* temp, int* position, int* device_output, int part_num ,int length)
+{
+    // __shared__ int device_input_shm[1024];
+    __shared__ int temp_shm[1024];
+    __shared__ int position_shm[1024];
+
+    for(size_t part_i = blockIdx.x; part_i < part_num; part_i += gridDim.x)
+    {
+        size_t thread_id = threadIdx.x + part_i * blockDim.x;
+        if(thread_id < length)
+        {
+            // device_input_shm[threadIdx.x] = device_input[thread_id];
+            temp_shm[threadIdx.x] = temp[thread_id];
+            position_shm[threadIdx.x] = position[thread_id];
+            __syncthreads();
+
+            if(temp_shm[threadIdx.x] == 1)
+            {
+                device_output[position_shm[threadIdx.x]] = thread_id;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
@@ -342,7 +392,38 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    int* temp = nullptr;
+    int* scan_temp = nullptr;
+    int* length_ = new int[1];
+
+    checkCudaErrors(cudaMalloc((void**)&temp, sizeof(int) * length));
+    checkCudaErrors(cudaMalloc((void**)&scan_temp, sizeof(int) * length));
+
+    checkKernelErrors();
+
+    int block_size = 1024;
+    int part_num = (length + block_size - 1) / block_size;
+    int block_num = std::min(128, part_num);
+
+    set_flag<<<block_num, block_size>>>(device_input, length, part_num, temp);
+    cudaDeviceSynchronize();
+    checkKernelErrors();
+
+    exclusive_scan(temp, length, scan_temp);
+    cudaDeviceSynchronize();
+    checkKernelErrors();
+
+    scatter<<<block_num, block_size>>>(temp, scan_temp, device_output, part_num, length);
+    cudaDeviceSynchronize();
+    checkKernelErrors();
+
+    checkCudaErrors(cudaMemcpy(length_, scan_temp+length-1, sizeof(int), cudaMemcpyDeviceToHost));
+    
+    checkKernelErrors();
+
+    cudaFree(temp);
+    cudaFree(scan_temp);
+    return *length_; 
 }
 
 
@@ -361,6 +442,7 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
     cudaMemcpy(device_input, input, length * sizeof(int), cudaMemcpyHostToDevice);
 
     cudaDeviceSynchronize();
+    std::cout << "start_find_repeat" << std::endl;
     double startTime = CycleTimer::currentSeconds();
     
     int result = find_repeats(device_input, length, device_output);
