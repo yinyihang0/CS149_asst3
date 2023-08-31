@@ -17,6 +17,10 @@
 #include "util.h"
 #include "circleBoxTest.cu_inl"
 
+#define BLOCK_DIM 1024
+#define SCAN_BLOCK_DIM   BLOCK_DIM  // needed by sharedMemExclusiveScan implementation
+#include "exclusiveScan.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -411,10 +415,10 @@ __global__ void kernelRenderCircles
     // printf("start");
     // if(threadIdx.x == 0 && threadIdx.y == 0)
     //     printf("gridDim: %d, %d,  blockDim: %d, %d\n", gridDim.x, gridDim.y, blockDim.x, blockDim.y);
-    extern __shared__ char sharedMem[];
-    short* circle_in_flag = (short*) sharedMem;
-    short* circle_index = (short*)&sharedMem[sizeof(short) * numCircles];
-    short* circle_num_in_block = (short*)&sharedMem[2 * sizeof(short) * numCircles];
+    __shared__ uint prefixSumInput[BLOCK_DIM];
+    __shared__ uint prefixSumOutput[BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * BLOCK_DIM];
+    __shared__ uint circle_num_in_block;
     // if(blockIdx.x == 0 && blockIdx.y == 0)
         // printf("block id %d, startCircle: %d\n", blockIdx.x, startCircle);
     for(short block_id_x = blockIdx.x; block_id_x < block_num_x; block_id_x+=gridDim.x)
@@ -431,56 +435,53 @@ __global__ void kernelRenderCircles
             float pixel_index_y = (static_cast<float>(pixel_index_y_i) + 0.5f) * invHeight;
             float pixel_begin_y = (static_cast<float>(block_id_y * blockDim.y) + 0.5f) * invHeight;
             float block_end_y = (static_cast<float>((block_id_y + 1) * blockDim.y - 1) + 0.5f) * invHeight;
-            for(size_t c_id_block = block_thread_id; c_id_block < numCircles; c_id_block+=blockDim.x * blockDim.y)
-            {
-                int c_id = c_id_block + startCircle;
-                size_t index3 = (c_id) * 3;
-                float3 p =  *(float3*)(&cuConstRendererParams.position[index3]);
-                float rad = cuConstRendererParams.radius[c_id];
+
+
+            int c_id = block_thread_id + startCircle;
+            size_t index3 = (c_id) * 3;
+            float3 p =  *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[c_id];
                 // printf("c_id: %d, px %f, py %f, pixel_begin_x %d, block_end_x %d, pixel_begin_y %d, block_end_y %d \n", 
                 //         c_id,     p.x ,  p.y,   pixel_begin_x,    block_end_x,    pixel_begin_y,    block_end_y);
-                if(circleInBoxConservative(p.x, p.y, rad, pixel_begin_x,  block_end_x, block_end_y, pixel_begin_y)
-                    && circleInBox(p.x, p.y, rad, pixel_begin_x,  block_end_x, block_end_y, pixel_begin_y))
-                {
-                    circle_in_flag[c_id_block] = 1;
-                }
-                else
-                {
-                    circle_in_flag[c_id_block] = 0;
-                }
+            if(circleInBoxConservative(p.x, p.y, rad, pixel_begin_x,  block_end_x, block_end_y, pixel_begin_y)
+                && circleInBox(p.x, p.y, rad, pixel_begin_x,  block_end_x, block_end_y, pixel_begin_y))
+            {
+                prefixSumInput[block_thread_id] = 1;
+            }
+            else
+            {
+                prefixSumInput[block_thread_id] = 0;
             }
             __syncthreads();
 
-            if(block_thread_id == 0)
-            {
-                // 这里不应该调用这个
-                thrust::exclusive_scan(thrust::device, circle_in_flag, circle_in_flag + numCircles, circle_index);
+           
+            sharedMemExclusiveScan(block_thread_id, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCK_DIM);
                 // if(circle_in_flag[num_circle_kernel-1] == 1)
-                *circle_num_in_block = circle_index[numCircles-1] + circle_in_flag[numCircles-1];
+            
+            __syncthreads();
+            if(block_thread_id == 0)
+                circle_num_in_block = prefixSumOutput[numCircles-1] + prefixSumInput[numCircles-1];
                 // printf("circle_num: %d \n", *circle_num_in_block );
-            }
             // if(pixel_index_x_i == 0 && pixel_index_y_i == 512)
             // {
             //     printf(" *circle_num_in_block: %d \n",  (int)(*circle_num_in_block));
             // }
             __syncthreads();
 
-            for(size_t c_id_block = block_thread_id; c_id_block < numCircles; c_id_block+=blockDim.x * blockDim.y)
+            if(prefixSumInput[block_thread_id])
             {
-                if(circle_in_flag[c_id_block])
-                {
-                    circle_in_flag[circle_index[c_id_block]] = (short)c_id_block;
-                }
+                prefixSumScratch[prefixSumOutput[block_thread_id]] = block_thread_id;
             }
+
             __syncthreads();
 
             if(pixel_index_x < 1 && pixel_index_y < 1)
             {
                 float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixel_index_y_i * cuConstRendererParams.imageWidth + pixel_index_x_i)]);
-                for(size_t i = 0; i < *circle_num_in_block; ++i)
+                for(size_t i = 0; i < circle_num_in_block; ++i)
                 {
                     
-                    int c_id = (int)circle_in_flag[i] + startCircle;
+                    int c_id = prefixSumScratch[i] + startCircle;
                     int index3 = 3 * c_id;
                     float3 p =  *(float3*)(&cuConstRendererParams.position[index3]);
                     float rad = cuConstRendererParams.radius[c_id];
@@ -494,8 +495,7 @@ __global__ void kernelRenderCircles
                     if(circleInBoxConservative(p.x, p.y, rad, pixel_index_x, pixel_index_x, pixel_index_y, pixel_index_y)
                         && circleInBox(p.x, p.y, rad,  pixel_index_x, pixel_index_x, pixel_index_y, pixel_index_y))
                     {
-                        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixel_index_x_i) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixel_index_y_i) + 0.5f));
+                        float2 pixelCenterNorm = make_float2(pixel_index_x, pixel_index_y);
                         shadePixel(c_id, pixelCenterNorm, p, imgPtr);
                     }
                 }
@@ -724,23 +724,23 @@ CudaRenderer::render() {
     size_t block_num_x = (image->width + blockDim.x - 1) / blockDim.x;
     size_t block_num_y = (image->height + blockDim.y - 1 ) / blockDim.y;
     size_t grid_d_x = std::min<size_t>(block_num_x, 32);
-    size_t grid_d_y = std::min<size_t>(block_num_y, 16);
+    size_t grid_d_y = std::min<size_t>(block_num_y, 32);
     dim3 gridDim(grid_d_x, grid_d_y);
 
     float invWidth = 1.f / image->width;
     float invHeight = 1.f / image->height;
 
-    size_t numper = 12;
+    size_t numper = 10;
     size_t numIter = (numCircles +  (1 << numper) - 1) >> numper;
     std::cout << block_num_x << " " << block_num_y << std::endl;
     for(size_t i = 0; i < numIter; ++i)
     {
         int startCircle = i << numper;
-        int num_circle_kernel = std::min<int>(1<<numper, numCircles - startCircle);
-        
+        // int num_circle_kernel = std::min<int>(1<<numper, numCircles - startCircle);
+        int num_circle_kernel = 1 << numper;
         // std::cout << startCircle << " " <<startCircle + num_circle_kernel << std::endl;
 
-        kernelRenderCircles<<<gridDim, blockDim,  sizeof(short) * (num_circle_kernel * 2 + 1)>>>
+        kernelRenderCircles<<<gridDim, blockDim>>>
                             (block_num_x, block_num_y, invWidth, invHeight, num_circle_kernel, startCircle);
         cudaCheckError( cudaDeviceSynchronize() );   
     }
