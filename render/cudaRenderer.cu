@@ -412,98 +412,79 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 __global__ void kernelRenderCircles
     (size_t block_num_x, size_t block_num_y, float invWidth, float invHeight, int numCircles, int startCircle) 
 {
-    // printf("start");
-    // if(threadIdx.x == 0 && threadIdx.y == 0)
-    //     printf("gridDim: %d, %d,  blockDim: %d, %d\n", gridDim.x, gridDim.y, blockDim.x, blockDim.y);
     __shared__ uint prefixSumInput[BLOCK_DIM];
     __shared__ uint prefixSumOutput[BLOCK_DIM];
     __shared__ uint prefixSumScratch[2 * BLOCK_DIM];
     __shared__ uint circle_num_in_block;
-    // if(blockIdx.x == 0 && blockIdx.y == 0)
-        // printf("block id %d, startCircle: %d\n", blockIdx.x, startCircle);
-    for(short block_id_x = blockIdx.x; block_id_x < block_num_x; block_id_x+=gridDim.x)
+    
+    short pixel_index_x_i = blockIdx.x * blockDim.x + threadIdx.x;
+    float pixel_index_x = (static_cast<float>(pixel_index_x_i) + 0.5f) * invWidth;
+    float pixel_begin_x = (static_cast<float>(blockIdx.x * blockDim.x) + 0.5f)  * invWidth;
+    float block_end_x = (static_cast<float>((blockIdx.x + 1) * blockDim.x - 1) + 0.5f)  * invWidth;
+       
+    short block_thread_id = threadIdx.y * blockDim.x + threadIdx.x;
+
+    short pixel_index_y_i = blockIdx.y * blockDim.y + threadIdx.y;
+    float pixel_index_y = (static_cast<float>(pixel_index_y_i) + 0.5f) * invHeight;
+    float pixel_begin_y = (static_cast<float>(blockIdx.y * blockDim.y) + 0.5f) * invHeight;
+    float block_end_y = (static_cast<float>((blockIdx.y + 1) * blockDim.y - 1) + 0.5f) * invHeight;
+
+
+    int c_id = block_thread_id + startCircle;
+    size_t index3 = (c_id) * 3;
+    float3 p =  *(float3*)(&cuConstRendererParams.position[index3]);
+    float rad = cuConstRendererParams.radius[c_id];
+               
+    if(circleInBoxConservative(p.x, p.y, rad, pixel_begin_x,  block_end_x, block_end_y, pixel_begin_y)
+            && circleInBox(p.x, p.y, rad, pixel_begin_x,  block_end_x, block_end_y, pixel_begin_y))
     {
-        short pixel_index_x_i = block_id_x * blockDim.x + threadIdx.x;
-        float pixel_index_x = (static_cast<float>(pixel_index_x_i) + 0.5f) * invWidth;
-        float pixel_begin_x = (static_cast<float>(block_id_x * blockDim.x) + 0.5f)  * invWidth;
-        float block_end_x = (static_cast<float>((block_id_x + 1) * blockDim.x - 1) + 0.5f)  * invWidth;
-        for(short block_id_y = blockIdx.y; block_id_y < block_num_y; block_id_y+=gridDim.y)
+        prefixSumInput[block_thread_id] = 1;
+    }
+    else
+    {
+        prefixSumInput[block_thread_id] = 0;
+    }
+    __syncthreads();
+    
+    sharedMemExclusiveScan(block_thread_id, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCK_DIM);
+    
+    __syncthreads();
+    if(block_thread_id == 0)
+        circle_num_in_block = prefixSumOutput[numCircles-1] + prefixSumInput[numCircles-1];
+    
+    __syncthreads();
+
+    if(prefixSumInput[block_thread_id])
+    {
+        prefixSumScratch[prefixSumOutput[block_thread_id]] = block_thread_id;
+    }
+
+    __syncthreads();
+
+    if(pixel_index_x < 1 && pixel_index_y < 1)
+    {
+        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixel_index_y_i * cuConstRendererParams.imageWidth + pixel_index_x_i)]);
+        for(size_t i = 0; i < circle_num_in_block; ++i)
         {
-            short block_thread_id = threadIdx.y * blockDim.x + threadIdx.x;
-
-            short pixel_index_y_i = block_id_y * blockDim.y + threadIdx.y;
-            float pixel_index_y = (static_cast<float>(pixel_index_y_i) + 0.5f) * invHeight;
-            float pixel_begin_y = (static_cast<float>(block_id_y * blockDim.y) + 0.5f) * invHeight;
-            float block_end_y = (static_cast<float>((block_id_y + 1) * blockDim.y - 1) + 0.5f) * invHeight;
-
-
-            int c_id = block_thread_id + startCircle;
-            size_t index3 = (c_id) * 3;
+            
+            int c_id = prefixSumScratch[i] + startCircle;
+            int index3 = 3 * c_id;
             float3 p =  *(float3*)(&cuConstRendererParams.position[index3]);
             float rad = cuConstRendererParams.radius[c_id];
-                // printf("c_id: %d, px %f, py %f, pixel_begin_x %d, block_end_x %d, pixel_begin_y %d, block_end_y %d \n", 
-                //         c_id,     p.x ,  p.y,   pixel_begin_x,    block_end_x,    pixel_begin_y,    block_end_y);
-            if(circleInBoxConservative(p.x, p.y, rad, pixel_begin_x,  block_end_x, block_end_y, pixel_begin_y)
-                && circleInBox(p.x, p.y, rad, pixel_begin_x,  block_end_x, block_end_y, pixel_begin_y))
-            {
-                prefixSumInput[block_thread_id] = 1;
+            float diffX = p.x - pixel_index_x;
+            float diffY = p.y - pixel_index_y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+
+            float maxDist = rad * rad;
+
+            // Process circle only if it's inside the circle
+            if ( pixelDist <= maxDist ) {
+                float2 pixelCenterNorm = make_float2(pixel_index_x, pixel_index_y);
+                shadePixel(c_id, pixelCenterNorm, p, imgPtr);
             }
-            else
-            {
-                prefixSumInput[block_thread_id] = 0;
-            }
-            __syncthreads();
-
-           
-            sharedMemExclusiveScan(block_thread_id, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCK_DIM);
-                // if(circle_in_flag[num_circle_kernel-1] == 1)
-            
-            __syncthreads();
-            if(block_thread_id == 0)
-                circle_num_in_block = prefixSumOutput[numCircles-1] + prefixSumInput[numCircles-1];
-                // printf("circle_num: %d \n", *circle_num_in_block );
-            // if(pixel_index_x_i == 0 && pixel_index_y_i == 512)
-            // {
-            //     printf(" *circle_num_in_block: %d \n",  (int)(*circle_num_in_block));
-            // }
-            __syncthreads();
-
-            if(prefixSumInput[block_thread_id])
-            {
-                prefixSumScratch[prefixSumOutput[block_thread_id]] = block_thread_id;
-            }
-
-            __syncthreads();
-
-            if(pixel_index_x < 1 && pixel_index_y < 1)
-            {
-                float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixel_index_y_i * cuConstRendererParams.imageWidth + pixel_index_x_i)]);
-                for(size_t i = 0; i < circle_num_in_block; ++i)
-                {
-                    
-                    int c_id = prefixSumScratch[i] + startCircle;
-                    int index3 = 3 * c_id;
-                    float3 p =  *(float3*)(&cuConstRendererParams.position[index3]);
-                    float rad = cuConstRendererParams.radius[c_id];
-                    
-                    // if(pixel_index_x_i == 0 && pixel_index_y_i == 512)
-                    // {
-                    //     // printf("i: %d, c_id %d *circle_num_in_block: %d \n", i, (int)c_id, (int)(*circle_num_in_block));
-                    //     printf("c_id %d \n", (int)c_id);
-                    // }
-                    
-                    if(circleInBoxConservative(p.x, p.y, rad, pixel_index_x, pixel_index_x, pixel_index_y, pixel_index_y)
-                        && circleInBox(p.x, p.y, rad,  pixel_index_x, pixel_index_x, pixel_index_y, pixel_index_y))
-                    {
-                        float2 pixelCenterNorm = make_float2(pixel_index_x, pixel_index_y);
-                        shadePixel(c_id, pixelCenterNorm, p, imgPtr);
-                    }
-                }
-
-            }
-            __syncthreads();
         }
     }
+    __syncthreads();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -723,9 +704,9 @@ CudaRenderer::render() {
     dim3 blockDim(32, 32);
     size_t block_num_x = (image->width + blockDim.x - 1) / blockDim.x;
     size_t block_num_y = (image->height + blockDim.y - 1 ) / blockDim.y;
-    size_t grid_d_x = std::min<size_t>(block_num_x, 32);
-    size_t grid_d_y = std::min<size_t>(block_num_y, 32);
-    dim3 gridDim(grid_d_x, grid_d_y);
+    // size_t grid_d_x = std::min<size_t>(block_num_x, 32);
+    // size_t grid_d_y = std::min<size_t>(block_num_y, 32);
+    dim3 gridDim(block_num_x, block_num_y);
 
     float invWidth = 1.f / image->width;
     float invHeight = 1.f / image->height;
